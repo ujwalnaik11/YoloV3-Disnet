@@ -10,33 +10,33 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-import visdom
+
+
 class Visualizer():
     """
-    封装了visdom的基本操作，但是你仍然可以通过`self.vis.function`
-    调用原生的visdom接口
+    Thin wrapper around visdom (optional dependency, imported lazily so that
+    detection / testing work without it). The native visdom API is still
+    reachable through `self.vis.<function>`.
     """
 
     def __init__(self, env='default', **kwargs):
         import visdom
         self.vis = visdom.Visdom(env=env, use_incoming_socket=False, **kwargs)
 
-        # 画的第几个数，相当于横座标
-        # 保存（’loss',23） 即loss的第23个点
+        # Per-plot x coordinate, e.g. ('loss', 23) is the 23rd point of 'loss'
         self.index = {}
         self.log_text = ''
 
     def reinit(self, env='default', **kwargs):
-        """
-        修改visdom的配置
-        """
-        self.vis = visdom.Visdom(env=env,use_incoming_socket=False,  **kwargs)
+        """Re-create the visdom connection with a new configuration."""
+        import visdom
+        self.vis = visdom.Visdom(env=env, use_incoming_socket=False, **kwargs)
         return self
 
     def plot_many(self, d):
         """
-        一次plot多个
-        @params d: dict (name,value) i.e. ('loss',0.11)
+        Plot several values at once.
+        @params d: dict (name, value), e.g. {'loss': 0.11}
         """
         for k, v in d.items():
             self.plot(k, v)
@@ -75,10 +75,11 @@ class Visualizer():
 
     def img_grid(self, name, input_3d):
         """
-        一个batch的图片转成一个网格图，i.e. input（36，64，64）
-        会变成 6*6 的网格图，每个格子大小64*64
+        Turn a batch of images into one grid image, e.g. an input of
+        (36, 64, 64) becomes a 6x6 grid of 64x64 tiles.
         """
-        self.img(name, tv.utils.make_grid(
+        from torchvision.utils import make_grid
+        self.img(name, make_grid(
             input_3d.cpu()[0].unsqueeze(1).clamp(max=1, min=0)))
 
     def log(self, info, win='log_text'):
@@ -99,9 +100,8 @@ def load_classes(path):
     """
     Loads class labels at 'path'
     """
-    fp = open(path, "r")
-    names = fp.read().split("\n")[:-1]
-    return names
+    with open(path, "r") as fp:
+        return [line.strip() for line in fp.read().splitlines() if line.strip()]
 
 
 def weights_init_normal(m):
@@ -227,7 +227,7 @@ def non_max_suppression(prediction, num_classes, conf_thres=0.5, nms_thres=0.4):
     output = [None for _ in range(len(prediction))]
     for image_i, image_pred in enumerate(prediction):
         # Filter out confidence scores below threshold
-        conf_mask = (image_pred[:, 4] >= conf_thres).squeeze()
+        conf_mask = image_pred[:, 4] >= conf_thres
         image_pred = image_pred[conf_mask]
         # If none are remaining => process next image
         if not image_pred.size(0):

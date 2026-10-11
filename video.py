@@ -1,273 +1,189 @@
+"""Real-time YOLOv3 detection + DisNet distance estimation on a webcam or video file.
+
+    python video.py                       # default webcam
+    python video.py --source clip.mp4     # video file
+    python video.py --scaler scaler.pkl   # use the scaler fitted on your DisNet training data (recommended)
+
+Requires the optional extras: pip install -r requirements-extras.txt
+"""
 from __future__ import division
-import time
-import torch 
-import torch.nn as nn
-from torch.autograd import Variable
-import numpy as np
-import cv2 
-from utils.utils import *
-from models import *
-#from util import *
-#from darknet import Darknet
-#from preprocess import prep_image, inp_to_image
-import pandas as pd
-import random 
+
 import argparse
-import pickle as pkl
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.ticker import NullLocator
-from skimage.transform import resize
-from tensorflow import keras
-
-
-#Disnet
-import pandas as pd
-import argparse
-
-from keras.models import model_from_json
-from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import MinMaxScaler
 import os
+import pickle
+import time
 
-import PIL.Image
-def prep_image(img, inp_dim):
-    """
-    Prepare image for inputting to the neural network. 
-    
-    Returns a Variable 
-    """
+import cv2
+import numpy as np
+import torch
+from skimage.transform import resize
 
-    orig_im = img
-    dim = orig_im.shape[1], orig_im.shape[0]
-    img = cv2.resize(orig_im, (inp_dim, inp_dim))
-    img_ = img[:,:,::-1].transpose((2,0,1)).copy()
-    img_ = torch.from_numpy(img_).float().div(255.0).unsqueeze(0)
-    return img_, orig_im, dim
-       
-def resize_img(img, img_size=416):
-    h, w, _ = img.shape
-    dim_diff = np.abs(h - w)
-    # Upper (left) and lower (right) padding
-    pad1, pad2 = dim_diff // 2, dim_diff - dim_diff // 2
-    # Determine padding
-    pad = ((pad1, pad2), (0, 0), (0, 0)) if h <= w else ((0, 0), (pad1, pad2), (0, 0))
-    # Add padding
-    input_img = np.pad(img, pad, 'constant', constant_values=128) / 255.
-    padded_h, padded_w, _ = input_img.shape
-    # Resize and normalize
-    input_img = resize(input_img, (img_size,img_size, 3), mode='reflect')
-    # Channels-first
-    input_img = np.transpose(input_img, (2, 0, 1))
-    # As pytorch tensor
-    input_img = torch.from_numpy(input_img).float().unsqueeze(0)
-    return input_img, img
-            
-def arg_parse():
-    """
-    Parse arguements to the detect module
-    
-    """
-    
-    
-    parser = argparse.ArgumentParser(description='YOLO v3 Cam Demo')
-    parser.add_argument("--confidence", dest = "confidence", help = "Object Confidence to filter predictions", default = 0.25)
-    parser.add_argument("--nms_thresh", dest = "nms_thresh", help = "NMS Threshhold", default = 0.4)
-    parser.add_argument("--reso", dest = 'reso', help = 
-                        "Input resolution of the network. Increase to increase accuracy. Decrease to increase speed",
-                        default = "416", type = str)
+from models import Darknet
+from utils.utils import load_classes, non_max_suppression
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="YOLO v3 + DisNet video demo")
+    parser.add_argument("--source", default="0", help="camera index (e.g. 0) or path to a video file")
+    parser.add_argument("--cfg", default="config/yolov3.cfg", help="darknet cfg file")
+    parser.add_argument("--weights", default="weights/yolov3.weights", help="darknet weights file")
+    parser.add_argument("--names", default="data/coco.names", help="class names file")
+    parser.add_argument("--confidence", type=float, default=0.8, help="object confidence threshold")
+    parser.add_argument("--nms_thresh", type=float, default=0.4, help="NMS IoU threshold")
+    parser.add_argument("--reso", type=int, default=416,
+                        help="network input resolution (multiple of 32). Larger = more accurate, smaller = faster")
+    parser.add_argument("--disnet_model", default="generated_files/model@1535470106",
+                        help="path of the DisNet Keras model WITHOUT extension (<name>.json + <name>.h5)")
+    parser.add_argument("--scaler", default=None,
+                        help="pickle of the StandardScaler fitted on the DisNet training inputs. Without it the "
+                             "legacy (incorrect) per-detection scaling is used, see README")
+    parser.add_argument("--no_display", action="store_true", help="do not open a window (headless); use with --max_frames")
+    parser.add_argument("--max_frames", type=int, default=0, help="stop after this many frames (0 = until the stream ends / 'q')")
     return parser.parse_args()
 
 
+def load_disnet(path):
+    """Load the DisNet regression model (Keras json architecture + h5 weights) and compile it once."""
+    try:  # TensorFlow's bundled Keras (what most people have installed)
+        from tensorflow.keras.models import model_from_json
+    except ImportError:
+        from keras.models import model_from_json
+    with open(path + ".json") as f:
+        model = model_from_json(f.read())
+    model.load_weights(path + ".h5")
+    model.compile(loss="mean_squared_error", optimizer="adam")
+    return model
 
-if __name__ == '__main__':
-    cfgfile = 'config/yolov3.cfg'
-    weightsfile = "weights/yolov3.weights"
 
-    classes = load_classes('data/coco.names')
-    cvfont = cv2.FONT_HERSHEY_PLAIN
-    # Bounding-box colors
-    cmap = plt.get_cmap('tab20b')
-    #cmap = plt.get_cmap('Vega20b')
-    colors = [cmap(i) for i in np.linspace(0, 1, 20)]
-    args = arg_parse()
-    confidence = float(args.confidence)
-    nms_thesh = float(args.nms_thresh)
-    start = 0
-    
-    CUDA = torch.cuda.is_available()
-    num_classes = 80
-    bbox_attrs = 5 + num_classes
-    
-    model = Darknet(cfgfile)
-    model.load_weights(weightsfile)
-    
-    #model.net_info["height"] = args.reso
-    #inp_dim = int(model.net_info["height"])
-    inp_dim = int(args.reso)
-    assert inp_dim % 32 == 0 
-    assert inp_dim > 32
+def resize_img(img, img_size=416):
+    """Pad the frame to a square, resize to the network resolution and return a (1, 3, H, W) tensor."""
+    h, w, _ = img.shape
+    dim_diff = np.abs(h - w)
+    pad1, pad2 = dim_diff // 2, dim_diff - dim_diff // 2
+    pad = ((pad1, pad2), (0, 0), (0, 0)) if h <= w else ((0, 0), (pad1, pad2), (0, 0))
+    # OpenCV frames are BGR, the network was trained on RGB
+    rgb = img[:, :, ::-1]
+    input_img = np.pad(rgb, pad, "constant", constant_values=128) / 255.0
+    input_img = resize(input_img, (img_size, img_size, 3), mode="reflect")
+    input_img = np.transpose(input_img, (2, 0, 1))
+    return torch.from_numpy(input_img.copy()).float().unsqueeze(0)
 
-    if CUDA:
-        model.cuda()
-        print('cam detect cuda is ready')
-        
-    Tensor = torch.cuda.FloatTensor if CUDA else torch.FloatTensor   
-         
+
+def estimate_distance(disnet, box, location, scaler=None):
+    """Predict distance (metres) for one box given in network-input coordinates (x1, y1, x2, y2)."""
+    from sklearn.preprocessing import StandardScaler
+
+    x_test = np.array([box], dtype=np.float64)
+    if scaler is None:
+        # Legacy behaviour: fit on this single sample (this maps the input to zeros -- see README)
+        scaler = StandardScaler()
+        x_test = scaler.fit_transform(x_test)
+    else:
+        x_test = scaler.transform(x_test)
+
+    y_pred = disnet.predict(x_test, verbose=0)
+
+    # Put the prediction in the first column of a dataset-shaped array so the scaler can invert it
+    dataset_like = np.zeros(shape=(len(y_pred), 4))
+    dataset_like[:, 0] = y_pred[:, 0]
+    y_pred = scaler.inverse_transform(dataset_like)[:, 0]
+    y_pred = (y_pred - 25) / 100
+    if location == "left":
+        y_pred += 1.5
+    elif location == "right":
+        y_pred -= 1
+    return float(y_pred[0])
+
+
+def main():
+    args = parse_args()
+    assert args.reso % 32 == 0 and args.reso > 32, "--reso must be a multiple of 32 and > 32"
+
+    classes = load_classes(args.names)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = Darknet(args.cfg, img_size=args.reso)
+    model.load_weights(args.weights)
+    model = model.to(device)
     model.eval()
+    print("YOLO running on %s" % device)
 
-    #Disnet
-    
-    MODEL = "model@1535470106"
-    WEIGHTS = "model@1535470106"
-    
-    # load json and create model
-    json_file = open('generated_files/{}.json'.format(MODEL), 'r')
-    loaded_model_json = json_file.read()
-    json_file.close()
-    loaded_model = model_from_json( loaded_model_json )
+    disnet = load_disnet(args.disnet_model)
 
-    # load weights into new model
-    loaded_model.load_weights("generated_files/{}.h5".format(WEIGHTS))
+    scaler = None
+    if args.scaler:
+        with open(args.scaler, "rb") as f:
+            scaler = pickle.load(f)
+    else:
+        print("WARNING: no --scaler given; distances use the legacy per-detection scaling and are not reliable.")
 
-    # correct solution
-    def softmax(x):
-        """Compute softmax values for each sets of scores in x."""
-        e_x = np.exp(x - np.max(x))
-        return e_x / e_x.sum(axis=0)
-    
-    #videofile = 'video.avi'
-    #cap = cv2.VideoCapture(videofile)
-    cap = cv2.VideoCapture(0)
-    
-    assert cap.isOpened(), 'Cannot capture source'
-    
+    source = int(args.source) if args.source.isdigit() else args.source
+    cap = cv2.VideoCapture(source)
+    assert cap.isOpened(), "Cannot capture source %r" % args.source
+
     frames = 0
-    rendering = 1  
-    while cap.isOpened():
-        
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            prev_time = time.time()
+            frame_h, frame_w = frame.shape[:2]
+            center = frame_w / 2
 
-        ret, frame = cap.read()
-
-        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH )
-        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT )
-        center  = width/2
-        
-
-        prev_time = time.time() 
-        if ret:
-            #resized_img, img, dim = prep_image(frame, inp_dim)
-            resized_img, img = resize_img(frame,inp_dim)
-            #print((resized_img.size(),type(resized_img)))
-            #cv2.imshow('resized_img',resized_img)    
-            input_imgs = Variable(resized_img.type(Tensor))
-            #print((resized_img.size(),type(resized_img)))
-            # Get detections
+            input_img = resize_img(frame, args.reso).to(device)
             with torch.no_grad():
-                detections = model(input_imgs)
-                #print(detections)
-                alldetections = non_max_suppression(detections, 80, 0.8, 0.4)
-                #print('detections get')
-                #print((alldetections[0]))
-                #print(type(alldetections[0]))
-            detection = alldetections[0]
-            current_time = time.time()
-            inference_time = current_time - prev_time
-            #fps = int(1/(inference_time))
-            fps =  cap.get(cv2.CAP_PROP_FPS)
-            print('current fps is : %d'%fps)
-    
-            if(rendering):
-                kitti_img_size = 416
-                # The amount of padding that was added
-                #pad_x = max(img.shape[0] - img.shape[1], 0) * (opt.img_size / max(img.shape))
-                #pad_y = max(img.shape[1] - img.shape[0], 0) * (opt.img_size / max(img.shape))
-                pad_x = max(img.shape[0] - img.shape[1], 0) * (kitti_img_size / max(img.shape))
-                pad_y = max(img.shape[1] - img.shape[0], 0) * (kitti_img_size / max(img.shape))
-                # Image height and width after padding is removed
-                unpad_h = kitti_img_size - pad_y
-                unpad_w = kitti_img_size - pad_x
-        
-                # Draw bounding boxes and labels of detections
-                if detection is not None:
-                    #print(img.shape)
-                    unique_labels = detection[:, -1].cpu().unique()
-                    n_cls_preds = min(len(unique_labels),20)
-                    bbox_colors = random.sample(colors, n_cls_preds)
-                    for x1, y1, x2, y2, conf, cls_conf, cls_pred in detection:
-                        loc = None
-                        centroid = (x1+x2)/2
-                    
-                        if centroid< (center - center/2 ): loc = "left"
-                        elif centroid < center: loc = "center"
-                        elif centroid < (center + center/3 ): loc="right"
-                        cls_pred = min(cls_pred,80)     
-                        #print ('\t+ Label: %s, Conf: %.5f' % (classes[int(cls_pred)], cls_conf.item()))
-                        # Rescale coordinates to original dimensions
-                        box_h = int(((y2 - y1) / unpad_h) * (img.shape[0]))
-                        box_w = int(((x2 - x1) / unpad_w) * (img.shape[1]) )
-                        y1b = int(((y1 - pad_y // 2) / unpad_h) * (img.shape[0]))
-                        x1b = int(((x1 - pad_x // 2) / unpad_w) * (img.shape[1]))
-                        x2b = int(x1b + box_w)
-                        y2b = int(y1b + box_h)
-                        #color = bbox_colors[int(np.where(unique_labels == int(cls_pred))[0])]
-                        # get data
-                        
-                        X_test = [[x1, y1, x2, y2]]
+                detections = non_max_suppression(model(input_img), len(classes), args.confidence, args.nms_thresh)[0]
 
-                        # standardized data
-                        scaler = StandardScaler()
-                        
-                        X_test = scaler.fit_transform(X_test)
+            # Geometry to map network-space boxes back onto the original frame
+            pad_x = max(frame_h - frame_w, 0) * (args.reso / max(frame.shape[:2]))
+            pad_y = max(frame_w - frame_h, 0) * (args.reso / max(frame.shape[:2]))
+            unpad_h = args.reso - pad_y
+            unpad_w = args.reso - pad_x
 
-                        # evaluate loaded model on test data
-                        loaded_model.compile(loss='mean_squared_error', optimizer='adam')
-                        y_pred = loaded_model.predict(X_test)
+            if detections is not None:
+                for x1, y1, x2, y2, conf, cls_conf, cls_pred in detections:
+                    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
 
-                        #y_pred = y_pred*(-1)
-                        #scale = np.round(y_pred*10)%10
-                        #y_pred = y_pred+1000*(scale)
-                        #y_pred = y_pred//100
+                    centroid = (x1 + x2) / 2
+                    loc = None
+                    if centroid < (center - center / 2):
+                        loc = "left"
+                    elif centroid < center:
+                        loc = "center"
+                    elif centroid < (center + center / 3):
+                        loc = "right"
 
-                        # create empty table with 12 fields
-                        trainPredict_dataset_like = np.zeros(shape=(len(y_pred), 4) )
-                        # put the predicted values in the right field
-                        trainPredict_dataset_like[:,0] = y_pred[:,0]
-                        # inverse transform and then select the right field
-                        y_pred = scaler.inverse_transform(trainPredict_dataset_like)[:,0]
-                        #y_pred = scaler.inverse_transform(y_pred)
-                        y_pred = (y_pred - 25)/100
-                        if loc =="left": y_pred+=1.5
-                        elif loc=="right": y_pred-=1
-                        # scale up predictions to original values
-                        #y_pred = scaler.inverse_transform(y_pred)
-                        print(y_pred)
-                    
-                        #print(color)
-                        #cv2.line(img,(int(x1), int(y1-5)),(int(x2), int(y1-5)),(255,255,255),14)
-                        #cv2.putText(img,classes[int(cls_pred)],(int(x1), int(y1), int(y_pred)), cvfont, 1.5, (color[0]*255,color[1]*255,color[2]*255),2)
+                    # Box in original frame coordinates (for drawing)
+                    x1b = int(((x1 - pad_x // 2) / unpad_w) * frame_w)
+                    y1b = int(((y1 - pad_y // 2) / unpad_h) * frame_h)
+                    x2b = int(((x2 - pad_x // 2) / unpad_w) * frame_w)
+                    y2b = int(((y2 - pad_y // 2) / unpad_h) * frame_h)
 
-                        cv2.putText(img, classes[int(cls_pred)], (int(x1), int(y1)), cvfont, 1.5, (255, 0, 0),2)
-                        cv2.rectangle(img, (int(x1b),int(y1b)), (int(x2b),int(y2b)), (255, 0, 0), 1)
+                    distance = estimate_distance(disnet, [x1, y1, x2, y2], loc, scaler)
+                    name = classes[min(int(cls_pred), len(classes) - 1)]
+                    text = "{} m".format(round(distance, 2))
+                    print(name, text, loc)
 
-                        
-                        string = "{} m".format(y_pred)
-                        cv2.putText(img, string, (int((x1+x2)/2), int((y1+y2)/2)), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
-                        print(classes[int(cls_pred)] , string , loc)
-                        
-                cv2.imshow('frame', img)
-                # free buffer
-                #cv2.imshow('kitti detecting window',plt)
-                #plt.savefig('output/%d.png' % (img_i), bbox_inches='tight', pad_inches=0.0)
-                key = cv2.waitKey(1)  
-                if key & 0xFF == ord('q'):
-                    break  
-                
-        #no ret berak         
-        else:
-            break
-    
+                    cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), (255, 0, 0), 1)
+                    cv2.putText(frame, name, (x1b, max(y1b - 5, 12)), cv2.FONT_HERSHEY_PLAIN, 1.5, (255, 0, 0), 2)
+                    cv2.putText(frame, text, ((x1b + x2b) // 2, (y1b + y2b) // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
 
-    
-    
+            fps = 1.0 / max(time.time() - prev_time, 1e-6)
+            cv2.putText(frame, "%.1f FPS" % fps, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
+            frames += 1
+            if not args.no_display:
+                cv2.imshow("frame", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            if args.max_frames and frames >= args.max_frames:
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

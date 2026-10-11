@@ -1,101 +1,94 @@
-import numpy as np
-import cv2
+"""Convert KITTI object-detection labels to YOLO / darknet format.
+
+KITTI line:  <type> <trunc> <occ> <alpha> x1 y1 x2 y2 <h> <w> <l> <x> <y> <z> <ry> [score]
+YOLO line:   <class_id> <cx> <cy> <w> <h>        (all normalised to 0..1)
+
+Usage
+-----
+    python label_transform/kitti2coco-label-trans.py \
+        --images  data/kitti/images/train \
+        --labels  data/kitti/labels_raw/train \
+        --out     data/kitti/labels/train \
+        --names   data/kitti.names \
+        --list    data/kitti/train.txt
+
+Images and labels are paired by file name (e.g. 000000.png <-> 000000.txt),
+objects of class 'DontCare' (or any class not listed in --names) are skipped.
+`--list` writes the image list consumed by `config/*.data`; with `--relative`
+(the default) the paths are written relative to the current directory so the
+list works on any machine.
+"""
+import argparse
 import os
 import sys
 
-#set your data_set absolute path
-#as for me, for example 
-# test example
-kitti_img_path ='/home/pakcy/Desktop/PyTorch-YOLOv3-kitti/label_transform/kitti/images/'
-kitti_label_path = '/home/pakcy/Desktop/PyTorch-YOLOv3-kitti/label_transform/kitti/lables/'
+from PIL import Image
 
 
+def load_names(path):
+    with open(path) as f:
+        names = [line.strip() for line in f if line.strip()]
+    return {name: i for i, name in enumerate(names)}
 
-#transformed lables to save path
-kitti_label_tosave_path = 'kitti/labels2coco/'
 
-#the absolute ptah of your data set
-#kitti_data_real_path = '/home/pakcy/Desktop/PyTorch-YOLOv3/data/kitti/images/train/'
+def convert_label_file(label_path, img_w, img_h, name_to_id):
+    lines = []
+    with open(label_path) as f:
+        for raw in f:
+            fields = raw.split()
+            if len(fields) < 8:
+                continue
+            cls = fields[0]
+            if cls not in name_to_id:  # 'DontCare' and unknown classes
+                continue
+            x1, y1, x2, y2 = (float(v) for v in fields[4:8])
+            cx = (x1 + x2) / 2.0 / img_w
+            cy = (y1 + y2) / 2.0 / img_h
+            w = (x2 - x1) / img_w
+            h = (y2 - y1) / img_h
+            lines.append("%d %.6f %.6f %.6f %.6f\n" % (name_to_id[cls], cx, cy, w, h))
+    return lines
 
-index = 0
-cvfont = cv2.FONT_HERSHEY_SIMPLEX
 
-kitti_names = open('kitti.names','r')
-kitti_names_contents = kitti_names.readlines()                
-kitti_images = os.listdir(kitti_img_path)
-kitti_labels = os.listdir(kitti_label_path)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--images", required=True, help="directory with KITTI images")
+    ap.add_argument("--labels", required=True, help="directory with raw KITTI label .txt files")
+    ap.add_argument("--out", required=True, help="directory to write YOLO label files to")
+    ap.add_argument("--names", default="data/kitti.names", help="class names file (one per line)")
+    ap.add_argument("--list", default=None, help="optional: write an image list file here")
+    ap.add_argument("--absolute", action="store_true", help="write absolute paths in --list instead of relative ones")
+    args = ap.parse_args()
 
-kitti_images.sort()
-kitti_labels.sort()
+    name_to_id = load_names(args.names)
+    os.makedirs(args.out, exist_ok=True)
 
-kitti_names_dic_key = []
-for class_name in kitti_names_contents:
-    kitti_names_dic_key.append(class_name.rstrip())
-values = range(len(kitti_names_dic_key))
-kitti_names_num = dict(zip(kitti_names_dic_key,values))
+    exts = (".png", ".jpg", ".jpeg")
+    images = sorted(f for f in os.listdir(args.images) if f.lower().endswith(exts))
+    if not images:
+        sys.exit("No images found in %s" % args.images)
 
-#print(kitti_names_num)
+    written, missing = [], 0
+    for fname in images:
+        stem = os.path.splitext(fname)[0]
+        label_path = os.path.join(args.labels, stem + ".txt")
+        if not os.path.exists(label_path):
+            missing += 1
+            continue
+        with Image.open(os.path.join(args.images, fname)) as im:
+            img_w, img_h = im.size
+        lines = convert_label_file(label_path, img_w, img_h, name_to_id)
+        with open(os.path.join(args.out, stem + ".txt"), "w") as f:
+            f.writelines(lines)
+        written.append(os.path.join(args.images, fname))
 
-#创建训练集图片的List
-f = open('train.txt','w')
-for img in kitti_images:
-    f.write(kitti_img_path+img+'\n')
-f.close()
+    if args.list:
+        with open(args.list, "w") as f:
+            for p in written:
+                f.write((os.path.abspath(p) if args.absolute else os.path.normpath(p)) + "\n")
 
-#kitti数据集 相对坐标 转换为绝对坐标
-for indexi in range(len(kitti_images)):
-    kitti_img_totest_path = kitti_img_path + kitti_images[indexi]
-    kitti_label_totest_path = kitti_label_path + kitti_labels[indexi]
-    #print(kitti_label_totest_path,kitti_img_totest_path)
-    
-    kitti_img_totest = cv2.imread(kitti_img_totest_path)
-    #print(kitti_img_totest,type(kitti_img_totest))
-    img_height, img_width = kitti_img_totest.shape[0],kitti_img_totest.shape[1]
-    
-    kitti_label_totest = open(kitti_label_totest_path,'r')
-    
-    label_contents = kitti_label_totest.readlines()
-    #print(label_contents)
-    real_label = open(kitti_label_tosave_path + kitti_labels[indexi],'w')
-    
-    for line in label_contents:
-        data = line.split(' ')
-        x=y=w=h=0
-        if(len(data) == 15):
-            class_str = data[0]
-            if(class_str != 'DontCare'):
-                # for kitti calls is a string
-                # trans this to number by using kitti.names
-                #(x,y) center (w,h) size
-                x1 = float(data[4])
-                y1 = float(data[5])
-                x2 = float(data[6])
-                y2 = float(data[7])
-                
-                intx1 = int(x1)
-                inty1 = int(y1)
-                intx2 = int(x2)
-                inty2 = int(y2)
+    print("Converted %d label files (%d images had no label file)." % (len(written), missing))
 
-                bbox_center_x = float( (x1 + (x2 - x1) / 2.0) / img_width)
-                bbox_center_y = float( (y1 + (y2 - y1) / 2.0) / img_height)
-                bbox_width = float((x2 - x1) / img_width)
-                bbox_height = float((y2 - y1) / img_height)
 
-                #print(kitti_names_contents[class_num])
-                # cv2.putText()
-                # 输入参数为图像、文本、位置、字体、大小、颜色数组、粗细
-                #cv2.putText(kitti_img_totest, class_str, (intx1, inty1+3), cvfont, 2, (0,0,255), 1)
-                # cv2.rectangle()
-                # 输入参数分别为图像、左上角坐标、右下角坐标、颜色数组、粗细
-                #cv2.rectangle(kitti_img_totest, (intx1,inty1), (intx2,inty2), (0,255,0), 2)
-                line_to_write = str(kitti_names_num[class_str]) + ' ' + str(bbox_center_x)+ ' ' + str(bbox_center_y)+ ' ' + str(bbox_width)+ ' ' + str(bbox_height) +'\n'
-                real_label.write(line_to_write)
-                sys.stdout.write(str(int((indexi/len(kitti_images))*100))+'% '+'*******************->' "\r" )
-                sys.stdout.flush()
-
-    #cv2.imshow(str(indexi)+' kitti_label_show',kitti_img_totest)    
-    #cv2.waitKey()
-    real_label.close()
-kitti_names.close()
-print("Labels tranfrom finished!")
+if __name__ == "__main__":
+    main()

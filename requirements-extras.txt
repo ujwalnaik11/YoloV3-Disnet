@@ -1,0 +1,12 @@
+# Optional extras
+
+# video.py (webcam / video demo with DisNet distance estimation)
+opencv-python
+scikit-learn
+# The DisNet model in generated_files/ was saved with Keras 2.1. If loading it fails with a newer
+# TensorFlow (2.16+ ships Keras 3), install the legacy Keras instead:  pip install tf_keras
+# and run with the environment variable TF_USE_LEGACY_KERAS=1.
+tensorflow
+
+# train.py --visdom (live loss plots; run `python -m visdom.server` first)
+visdom

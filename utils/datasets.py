@@ -9,12 +9,32 @@ from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-
 from skimage.transform import resize
 
-import sys
+
+def _load_rgb(path):
+    """Open an image as an (H, W, 3) uint8 array (handles grayscale / RGBA)."""
+    return np.array(Image.open(path).convert('RGB'))
+
+
+def label_path_from_image_path(img_path):
+    """Map '<...>/images/<...>/x.png' to '<...>/labels/<...>/x.txt'.
+
+    Only the last '/images/' path component is replaced (not every occurrence of
+    the substring), so directories such as '/home/me/my_images_project/' are safe.
+    """
+    img_path = img_path.strip().replace('\\', '/')
+    # Prepend a '/' to relative paths so one starting with 'images/' also matches
+    probe = img_path if img_path.startswith('/') else '/' + img_path
+    marker = '/images/'
+    idx = probe.rfind(marker)
+    if idx == -1:
+        raise ValueError("Image path %r has no 'images' directory component, cannot derive its label path" % img_path)
+    label_path = probe[:idx] + '/labels/' + probe[idx + len(marker):]
+    if not img_path.startswith('/'):
+        label_path = label_path[1:]
+    return os.path.splitext(label_path)[0] + '.txt'
+
 
 class ImageFolder(Dataset):
     def __init__(self, folder_path, img_size=416):
@@ -24,7 +44,7 @@ class ImageFolder(Dataset):
     def __getitem__(self, index):
         img_path = self.files[index % len(self.files)]
         # Extract image
-        img = np.array(Image.open(img_path))
+        img = _load_rgb(img_path)
         h, w, _ = img.shape
         dim_diff = np.abs(h - w)
         # Upper (left) and lower (right) padding
@@ -49,8 +69,8 @@ class ImageFolder(Dataset):
 class ListDataset(Dataset):
     def __init__(self, list_path, img_size=416):
         with open(list_path, 'r') as file:
-            self.img_files = file.readlines()
-        self.label_files = [path.replace('images', 'labels').replace('.png', '.txt').replace('.jpg', '.txt') for path in self.img_files]
+            self.img_files = [line.strip() for line in file if line.strip()]
+        self.label_files = [label_path_from_image_path(path) for path in self.img_files]
         self.img_shape = (img_size, img_size)
         self.max_objects = 50
 
@@ -60,14 +80,8 @@ class ListDataset(Dataset):
         #  Image
         #---------
 
-        img_path = self.img_files[index % len(self.img_files)].rstrip()
-        img = np.array(Image.open(img_path))
-
-        # Handles images with less than three channels
-        while len(img.shape) != 3:
-            index += 1
-            img_path = self.img_files[index % len(self.img_files)].rstrip()
-            img = np.array(Image.open(img_path))
+        img_path = self.img_files[index % len(self.img_files)]
+        img = _load_rgb(img_path)
 
         h, w, _ = img.shape
         dim_diff = np.abs(h - w)
@@ -89,7 +103,7 @@ class ListDataset(Dataset):
         #  Label
         #---------
 
-        label_path = self.label_files[index % len(self.img_files)].rstrip()
+        label_path = self.label_files[index % len(self.img_files)]
 
         labels = None
         if os.path.exists(label_path):

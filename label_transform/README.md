@@ -1,12 +1,17 @@
-# Kitti label trans to COCO label 
+# KITTI label transform
 
-## this this a tool to tranfrom these two datasets labels.
-use`kitti2coco-label-trans.py' to tansfrom labels.
+`kitti2coco-label-trans.py` converts KITTI object-detection labels to YOLO / darknet format
+(`class cx cy w h`, all normalised to 0..1). Images and labels are paired by file name.
 
-before you run this scirpt, you should set your data sets absolute path:
-`kitti_img_path` and `kitti_label_path`
+```bash
+python label_transform/kitti2coco-label-trans.py \
+    --images label_transform/kitti/images \
+    --labels label_transform/kitti/labels \
+    --out    /tmp/yolo_labels \
+    --names  label_transform/kitti.names \
+    --list   /tmp/train.txt
+```
 
-and `kitti_label_tosave_path` will save these coordinate transformed label files.
-and `train.txt` is your kitti train set all images' absolute path, put it into `data/kitti` folder
-
-## Test on ubuntu 18.04 with python 3.6
+- `--list` writes the image list used by `config/*.data` (relative paths by default, `--absolute` for absolute ones).
+- `DontCare` objects and classes not present in `--names` are skipped.
+- `label_transform/kitti/` contains five raw KITTI samples to try it on.
