@@ -1,8 +1,8 @@
 # YoloV3-Disnet
 
-Object detection with **YOLOv3** (PyTorch) plus monocular **distance estimation** with a small
-**DisNet**-style regression network (Keras). YOLOv3 finds objects (trained here on **KITTI**), and DisNet
-turns each bounding box into an estimated distance in metres.
+Object detection with **YOLOv3** (PyTorch) plus monocular **distance estimation** with **DisNet**
+(Haseeb et al., 2018). YOLOv3 finds objects (trained here on **KITTI**), and DisNet turns each bounding box into an
+estimated distance in metres, from a single camera.
 
 | | |
 |---|---|
@@ -15,15 +15,19 @@ detect.py                 run the detector on a folder of images, save annotated
 train.py                  train / fine-tune on a dataset described by config/*.data
 test.py                   per-class AP and mAP on the validation list
 video.py                  webcam / video demo: YOLOv3 boxes + DisNet distances
+train_disnet.py           train a DisNet distance model on KITTI labels or your own annotations
 models.py                 Darknet / YOLOv3 model, cfg parser, weight loading & saving
 utils/
   datasets.py             image-folder and list-file datasets (letterbox padding, label loading)
   evaluation.py           mAP evaluation shared by train.py and test.py
+  disnet.py               DisNet: box -> 6 features -> distance (pure NumPy, no TensorFlow needed)
   utils.py                NMS, IoU, target building, AP, optional visdom wrapper
 config/                   yolov3, yolov3-tiny, yolov3-kitti cfgs + kitti.data / coco.data
 data/                     class names, a 16+16 image KITTI sample, sample images for detect.py
 label_transform/          KITTI -> YOLO label converter
-generated_files/          the DisNet Keras models (.json architecture + .h5 weights) used by video.py
+tests/                    DisNet regression tests + 1,795 real labelled boxes (class, box size, measured distance)
+generated_files/          disnet_model_3.npz = the authors' pretrained DisNet (used by video.py by default);
+                          model@*.json/.h5 are the old 4-input experiments, no longer used
 ```
 
 ## Setup
@@ -31,7 +35,7 @@ generated_files/          the DisNet Keras models (.json architecture + .h5 weig
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt            # detect / train / test
-pip install -r requirements-extras.txt     # only for video.py (opencv, tensorflow, scikit-learn) and --visdom
+pip install -r requirements-extras.txt     # only for video.py (opencv), importing Keras models (h5py) and --visdom
 ```
 
 ## Quick start
@@ -73,7 +77,7 @@ python test.py --weights_path checkpoints/kitti_best.weights
 ```bash
 wget https://pjreddie.com/media/files/yolov3.weights -P weights   # COCO weights (default for video.py)
 python video.py                       # default webcam, press q to quit
-python video.py --source clip.mp4 --scaler scaler.pkl
+python video.py --source clip.mp4
 ```
 
 ## Using your own KITTI data
@@ -90,23 +94,55 @@ python label_transform/kitti2coco-label-trans.py \
 
 Then point `config/kitti.data` at your list files. `DontCare` boxes and classes missing from `--names` are skipped.
 
-## DisNet distance estimation: read this before trusting `video.py`
+## DisNet distance estimation
 
-`video.py` feeds each YOLO box `(x1, y1, x2, y2)` into the DisNet regression network in `generated_files/`.
-That network was trained on **standardised** inputs, so at inference the inputs must be standardised with the
-**same scaler that was fitted on the training data**.
+`video.py` follows the DisNet paper. For every detected box it computes six features
 
-The original script instead fitted a fresh `StandardScaler` on every single detection. A scaler fitted on one
-sample maps the input to all zeros and turns the inverse transform into "add the box's x1 pixel coordinate", so the
-printed distance was effectively `(x1 + c - 25) / 100` regardless of the box. It is kept as a fallback (with a
-warning) so existing behaviour does not change silently, but for meaningful distances:
+```
+v = [1/Bw, 1/Bh, 1/Bd, Ch, Cw, Cb]
+```
 
-1. Save the scaler you fit on your DisNet training inputs: `pickle.dump(scaler, open("scaler.pkl", "wb"))`
-2. Run `python video.py --scaler scaler.pkl`
+where `Bw`, `Bh` are the box width / height relative to the image width / height, `Bd = sqrt(Bw^2 + Bh^2)`, and
+`Ch, Cw, Cb` are the typical real-world height / width / breadth (cm) of the detected class. A small fully
+connected network (here 6 -> 100 -> 100 -> 1, SELU) maps `v` to the distance in metres. **No input scaling is applied**;
+the features go into the network as they are. The code is in `utils/disnet.py` and is pure NumPy.
 
-The `left` / `right` offsets (+1.5 m / -1 m) and the `(y - 25) / 100` rescaling are hand-tuned constants from the
-original project and have not been re-derived. The DisNet files in `generated_files/` were saved with Keras 2.1; with
-recent TensorFlow see the note in `requirements-extras.txt`.
+- **Supported classes:** person, car, truck, bus, bicycle, motorbike, cat, dog, horse, sheep, cow (the classes the
+  authors defined sizes for; KITTI's `Pedestrian` and `Cyclist` are mapped to `person` / `bicycle`). Other detections
+  are drawn without a distance. Edit `CLASS_SIZES_CM` in `utils/disnet.py` to add classes.
+- **Pretrained model:** `generated_files/disnet_model_3.npz` is the authors' model from
+  [guanjianyu/DisNet](https://github.com/guanjianyu/DisNet) (MIT licence, see `generated_files/DisNet-LICENSE.txt`),
+  converted from Keras to NumPy arrays; the NumPy forward pass matches Keras to float precision.
+- **Feature order:** equation (1) of the paper lists `1/Bh` before `1/Bw`, but the authors' released training and
+  inference code, and therefore their pretrained model, use `1/Bw` first. This project follows the code.
+  Likewise `Bd` is taken from the normalised width / height as in the code.
+
+**Verified behaviour.** `python -m unittest discover -s tests -v` runs the checks. Among them: the NumPy forward pass
+matches an independent PyTorch implementation, and on 1,795 real labelled boxes (person / car / bicycle, measured with a
+laser scanner, from the authors' data-preparation notebook) the pretrained model reaches a mean absolute error of
+2.5 m (median 1.2 m, correlation 0.95, 73 % of estimates within 10 %). The same test shows that swapping the width/height
+order or normalising the diagonal by the image diagonal more than doubles the error (MAE about 5.5 m instead of 2.5 m),
+which is why the code follows the authors' feature definition. `truck`, `bus` and the animal classes use the authors' size table, but the published
+labelled data contains no examples of them, so those distances are extrapolations.
+
+**Accuracy depends on the camera.** The features are relative to the image size but not to the focal length, so
+a model is most accurate on cameras similar to the one it was trained on. The authors' model was trained on a
+2592x1944 camera. On the 74 well-visible (not heavily truncated or occluded) cars, pedestrians, cyclists and trucks in
+the 32 bundled KITTI sample images (ground truth from the KITTI 3D labels) it correlates well with the true distance
+(r = 0.80) but is off by about 20-25 % (median relative error; MAE about 8 m), which is expected for a different camera. For a KITTI-like setup, train DisNet on KITTI itself:
+
+```bash
+python train_disnet.py --kitti_labels /path/to/training/label_2 --kitti_images /path/to/training/image_2 \
+                       --out generated_files/disnet_kitti.npz
+python video.py --disnet_model generated_files/disnet_kitti.npz --weights <kitti yolo weights> --cfg config/yolov3-kitti.cfg --names data/kitti.names
+```
+
+`train_disnet.py` uses the paper's setup (3 hidden layers of 100 neurons, L1 loss, Adam, 80 / 10 / 10 split) and
+reports train / val / test error. The distance of a KITTI object comes from its 3D label (`--kitti_distance range`
+for the Euclidean camera-object distance or `depth` for the distance along the optical axis); heavily truncated or
+occluded objects are skipped, since the paper notes that partial boxes hurt accuracy. For your own data, pass
+annotation json files in the authors' format with `--annotations` (see the script's `--help`). On synthetic data from a
+pinhole-camera model, the trainer recovers distances to within the noise floor of the data (about 7 % error).
 
 ## Notes and known limitations
 
@@ -119,6 +155,7 @@ recent TensorFlow see the note in `requirements-extras.txt`.
 
 ## Credits
 
-Detector code is adapted from the open-source PyTorch-YOLOv3 implementation and its KITTI variant. DisNet follows
-the monocular distance-estimation idea from Haseeb et al., *DisNet: A novel method for distance estimation from
-monocular camera* (2018).
+Detector code is adapted from the open-source PyTorch-YOLOv3 implementation and its KITTI variant. DisNet is from
+Haseeb, Guan, Ristic-Durrant and Graeser, *DisNet: A novel method for distance estimation from monocular camera*
+(2018); the pretrained model and class sizes come from the authors' code at
+[guanjianyu/DisNet](https://github.com/guanjianyu/DisNet) (MIT).

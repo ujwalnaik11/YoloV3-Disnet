@@ -1,16 +1,18 @@
-"""Real-time YOLOv3 detection + DisNet distance estimation on a webcam or video file.
+"""Real-time YOLOv3 detection + DisNet distance estimation on a webcam or a video file.
 
-    python video.py                       # default webcam
+    python video.py                       # default webcam, COCO weights
     python video.py --source clip.mp4     # video file
-    python video.py --scaler scaler.pkl   # use the scaler fitted on your DisNet training data (recommended)
 
-Requires the optional extras: pip install -r requirements-extras.txt
+DisNet (Haseeb et al., 2018) estimates the camera-to-object distance from the size of each YOLO bounding
+box relative to the image and the typical real-world size of the detected class, see utils/disnet.py.
+Distances are shown for the classes DisNet has a size for (person, car, truck, bus, bicycle, motorbike,
+cat, dog, horse, sheep, cow); other detections are drawn without a distance.
+
+Requires opencv: pip install -r requirements-extras.txt
 """
 from __future__ import division
 
 import argparse
-import os
-import pickle
 import time
 
 import cv2
@@ -19,6 +21,7 @@ import torch
 from skimage.transform import resize
 
 from models import Darknet
+from utils.disnet import DisNet, canonical_class
 from utils.utils import load_classes, non_max_suppression
 
 
@@ -32,67 +35,65 @@ def parse_args():
     parser.add_argument("--nms_thresh", type=float, default=0.4, help="NMS IoU threshold")
     parser.add_argument("--reso", type=int, default=416,
                         help="network input resolution (multiple of 32). Larger = more accurate, smaller = faster")
-    parser.add_argument("--disnet_model", default="generated_files/model@1535470106",
-                        help="path of the DisNet Keras model WITHOUT extension (<name>.json + <name>.h5)")
-    parser.add_argument("--scaler", default=None,
-                        help="pickle of the StandardScaler fitted on the DisNet training inputs. Without it the "
-                             "legacy (incorrect) per-detection scaling is used, see README")
+    parser.add_argument("--disnet_model", default="generated_files/disnet_model_3.npz",
+                        help="DisNet model (.npz, or a Keras 2.x .h5 model). See train_disnet.py to train your own")
     parser.add_argument("--no_display", action="store_true", help="do not open a window (headless); use with --max_frames")
     parser.add_argument("--max_frames", type=int, default=0, help="stop after this many frames (0 = until the stream ends / 'q')")
     return parser.parse_args()
 
 
-def load_disnet(path):
-    """Load the DisNet regression model (Keras json architecture + h5 weights) and compile it once."""
-    try:  # TensorFlow's bundled Keras (what most people have installed)
-        from tensorflow.keras.models import model_from_json
-    except ImportError:
-        from keras.models import model_from_json
-    with open(path + ".json") as f:
-        model = model_from_json(f.read())
-    model.load_weights(path + ".h5")
-    model.compile(loss="mean_squared_error", optimizer="adam")
-    return model
-
-
-def resize_img(img, img_size=416):
-    """Pad the frame to a square, resize to the network resolution and return a (1, 3, H, W) tensor."""
-    h, w, _ = img.shape
-    dim_diff = np.abs(h - w)
-    pad1, pad2 = dim_diff // 2, dim_diff - dim_diff // 2
+def letterbox(frame_bgr, size):
+    """Pad a BGR frame to a square (grey), resize to `size` and return a (1, 3, size, size) RGB tensor."""
+    h, w, _ = frame_bgr.shape
+    diff = abs(h - w)
+    pad1, pad2 = diff // 2, diff - diff // 2
     pad = ((pad1, pad2), (0, 0), (0, 0)) if h <= w else ((0, 0), (pad1, pad2), (0, 0))
-    # OpenCV frames are BGR, the network was trained on RGB
-    rgb = img[:, :, ::-1]
-    input_img = np.pad(rgb, pad, "constant", constant_values=128) / 255.0
-    input_img = resize(input_img, (img_size, img_size, 3), mode="reflect")
-    input_img = np.transpose(input_img, (2, 0, 1))
-    return torch.from_numpy(input_img.copy()).float().unsqueeze(0)
+    rgb = frame_bgr[:, :, ::-1]  # OpenCV is BGR, the network was trained on RGB
+    img = np.pad(rgb, pad, "constant", constant_values=128) / 255.0
+    img = resize(img, (size, size, 3), mode="reflect")
+    return torch.from_numpy(np.transpose(img, (2, 0, 1)).copy()).float().unsqueeze(0)
 
 
-def estimate_distance(disnet, box, location, scaler=None):
-    """Predict distance (metres) for one box given in network-input coordinates (x1, y1, x2, y2)."""
-    from sklearn.preprocessing import StandardScaler
+def network_box_to_frame(box, frame_w, frame_h, size):
+    """Map (x1, y1, x2, y2) from letterboxed network coordinates back to original frame pixels."""
+    side = max(frame_w, frame_h)
+    factor = side / float(size)
+    pad_left = (side - frame_w) // 2 if frame_w < side else 0
+    pad_top = (side - frame_h) // 2 if frame_h < side else 0
+    x1, y1, x2, y2 = box
+    return x1 * factor - pad_left, y1 * factor - pad_top, x2 * factor - pad_left, y2 * factor - pad_top
 
-    x_test = np.array([box], dtype=np.float64)
-    if scaler is None:
-        # Legacy behaviour: fit on this single sample (this maps the input to zeros -- see README)
-        scaler = StandardScaler()
-        x_test = scaler.fit_transform(x_test)
-    else:
-        x_test = scaler.transform(x_test)
 
-    y_pred = disnet.predict(x_test, verbose=0)
+def annotate(frame, detections, classes, size, disnet):
+    """Draw boxes (and DisNet distances where available) onto `frame` in place.
 
-    # Put the prediction in the first column of a dataset-shaped array so the scaler can invert it
-    dataset_like = np.zeros(shape=(len(y_pred), 4))
-    dataset_like[:, 0] = y_pred[:, 0]
-    y_pred = scaler.inverse_transform(dataset_like)[:, 0]
-    y_pred = (y_pred - 25) / 100
-    if location == "left":
-        y_pred += 1.5
-    elif location == "right":
-        y_pred -= 1
-    return float(y_pred[0])
+    detections: tensor (N, 7) of x1, y1, x2, y2, obj_conf, cls_conf, cls_pred in network coordinates, or None.
+    Returns a list of (class_name, (x1, y1, x2, y2) in frame pixels, distance_m or None).
+    """
+    frame_h, frame_w = frame.shape[:2]
+    results = []
+    if detections is None:
+        return results
+    for x1, y1, x2, y2, _, _, cls_pred in detections.cpu().numpy():
+        name = classes[min(int(cls_pred), len(classes) - 1)]
+        box = network_box_to_frame((x1, y1, x2, y2), frame_w, frame_h, size)
+
+        distance = None
+        if disnet is not None and canonical_class(name) is not None:
+            # features use the full (unclipped) box and the original frame size, as in the paper
+            distance = disnet.estimate(box, name, frame_w, frame_h)
+        results.append((name, box, distance))
+
+        bx1, by1, bx2, by2 = (int(round(v)) for v in box)
+        bx1, bx2 = np.clip([bx1, bx2], 0, frame_w - 1)
+        by1, by2 = np.clip([by1, by2], 0, frame_h - 1)
+        label = name if distance is None else "%s %.1f m" % (name, distance)
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 0, 0), 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        ty = by1 - 6 if by1 - th - 6 >= 0 else by1 + th + 6
+        cv2.rectangle(frame, (bx1, ty - th - 4), (bx1 + tw + 4, ty + 4), (255, 0, 0), -1)
+        cv2.putText(frame, label, (bx1 + 2, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return results
 
 
 def main():
@@ -108,14 +109,7 @@ def main():
     model.eval()
     print("YOLO running on %s" % device)
 
-    disnet = load_disnet(args.disnet_model)
-
-    scaler = None
-    if args.scaler:
-        with open(args.scaler, "rb") as f:
-            scaler = pickle.load(f)
-    else:
-        print("WARNING: no --scaler given; distances use the legacy per-detection scaling and are not reliable.")
+    disnet = DisNet.load(args.disnet_model)
 
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
@@ -127,50 +121,16 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 break
-            prev_time = time.time()
-            frame_h, frame_w = frame.shape[:2]
-            center = frame_w / 2
+            start = time.time()
 
-            input_img = resize_img(frame, args.reso).to(device)
             with torch.no_grad():
-                detections = non_max_suppression(model(input_img), len(classes), args.confidence, args.nms_thresh)[0]
+                output = model(letterbox(frame, args.reso).to(device))
+                detections = non_max_suppression(output, len(classes), args.confidence, args.nms_thresh)[0]
 
-            # Geometry to map network-space boxes back onto the original frame
-            pad_x = max(frame_h - frame_w, 0) * (args.reso / max(frame.shape[:2]))
-            pad_y = max(frame_w - frame_h, 0) * (args.reso / max(frame.shape[:2]))
-            unpad_h = args.reso - pad_y
-            unpad_w = args.reso - pad_x
+            for name, _, distance in annotate(frame, detections, classes, args.reso, disnet):
+                print(name, "-" if distance is None else "%.2f m" % distance)
 
-            if detections is not None:
-                for x1, y1, x2, y2, conf, cls_conf, cls_pred in detections:
-                    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
-
-                    centroid = (x1 + x2) / 2
-                    loc = None
-                    if centroid < (center - center / 2):
-                        loc = "left"
-                    elif centroid < center:
-                        loc = "center"
-                    elif centroid < (center + center / 3):
-                        loc = "right"
-
-                    # Box in original frame coordinates (for drawing)
-                    x1b = int(((x1 - pad_x // 2) / unpad_w) * frame_w)
-                    y1b = int(((y1 - pad_y // 2) / unpad_h) * frame_h)
-                    x2b = int(((x2 - pad_x // 2) / unpad_w) * frame_w)
-                    y2b = int(((y2 - pad_y // 2) / unpad_h) * frame_h)
-
-                    distance = estimate_distance(disnet, [x1, y1, x2, y2], loc, scaler)
-                    name = classes[min(int(cls_pred), len(classes) - 1)]
-                    text = "{} m".format(round(distance, 2))
-                    print(name, text, loc)
-
-                    cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), (255, 0, 0), 1)
-                    cv2.putText(frame, name, (x1b, max(y1b - 5, 12)), cv2.FONT_HERSHEY_PLAIN, 1.5, (255, 0, 0), 2)
-                    cv2.putText(frame, text, ((x1b + x2b) // 2, (y1b + y2b) // 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1, cv2.LINE_AA)
-
-            fps = 1.0 / max(time.time() - prev_time, 1e-6)
+            fps = 1.0 / max(time.time() - start, 1e-6)
             cv2.putText(frame, "%.1f FPS" % fps, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             frames += 1
