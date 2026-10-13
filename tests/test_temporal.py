@@ -163,7 +163,9 @@ class TrainerTests(unittest.TestCase):
             os.makedirs(labels)
             write_sequences(labels)
             report = train_disnet_rnn.main(["--kitti_tracking_labels", labels, "--epochs", "30", "--batch_size", "64", "--n_val", "2",
-                                            "--n_test", "2", "--out", os.path.join(d, "gru.pt")])
+                                            "--n_test", "2", "--out", os.path.join(d, "gru.pt"),
+                                            "--ff_model", os.path.join(d, "missing.npz")])  # must warn, not crash
+            self.assertNotIn("ff_model", report)
             self.assertTrue(os.path.exists(os.path.join(d, "gru.pt")))
             dist, box, meta = load_temporal(os.path.join(d, "gru.pt"))
             self.assertIsNotNone(box)

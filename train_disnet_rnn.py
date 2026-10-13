@@ -185,6 +185,16 @@ def main(argv=None):
         box = GRUBox().to(device)
         box = fit(box, tr[2], tr[3], va[2], va[3], args.epochs, args.lr, args.batch_size, device, "GRU box")
 
+    # ---- save first, so that nothing in the report below can lose the trained models
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    save_temporal(args.out, gru.cpu(), None if box is None else box.cpu(),
+                  meta=dict(img_width=args.img_width, img_height=args.img_height, train_fps=10.0,
+                            train_sequences=sorted(train_ids), test_sequences=sorted(test_ids)))
+    print("Saved %s" % args.out)
+    gru.to(device)  # saving moved the models to the CPU
+    if box is not None:
+        box.to(device)
+
     # ---- report on the test sequences (last frame of every window)
     print("\nDistance on %d test windows (last frame of each window):" % len(te[0]))
     truth = te[1][:, -1]
@@ -193,7 +203,9 @@ def main(argv=None):
         ff_pred = ff(torch.from_numpy(te[0][:, -1]).to(device)).cpu().numpy()
     report = {"gru": distance_report("GRU, 3-frame window", gru_pred, truth),
               "feedforward": distance_report("feed-forward, single frame", ff_pred, truth)}
-    if args.ff_model:
+    if args.ff_model and not os.path.exists(args.ff_model):
+        print("  (skipping --ff_model: %s does not exist)" % args.ff_model)
+    elif args.ff_model:
         report["ff_model"] = distance_report("feed-forward (%s)" % os.path.basename(args.ff_model),
                                              DisNet.load(args.ff_model).predict(te[0][:, -1]), truth)
 
@@ -208,11 +220,6 @@ def main(argv=None):
             report["box"][name] = float(np.abs((pred - te[3]) * scale).mean())
             print("  %-34s %.2f px" % (name, report["box"][name]))
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    save_temporal(args.out, gru.cpu(), None if box is None else box.cpu(),
-                  meta=dict(img_width=args.img_width, img_height=args.img_height, train_fps=10.0,
-                            train_sequences=sorted(train_ids), test_sequences=sorted(test_ids)))
-    print("\nSaved %s" % args.out)
     return report
 
 
