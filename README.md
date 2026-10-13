@@ -16,11 +16,13 @@ train.py                  train / fine-tune on a dataset described by config/*.d
 test.py                   per-class AP and mAP on the validation list
 video.py                  webcam / video demo: YOLOv3 boxes + DisNet distances
 train_disnet.py           train a DisNet distance model on KITTI labels or your own annotations
+train_disnet_rnn.py       train the temporal (GRU) DisNet on KITTI tracking labels, compare it with the feed-forward one
 models.py                 Darknet / YOLOv3 model, cfg parser, weight loading & saving
 utils/
   datasets.py             image-folder and list-file datasets (letterbox padding, label loading)
   evaluation.py           mAP evaluation shared by train.py and test.py
   disnet.py               DisNet: box -> 6 features -> distance (pure NumPy, no TensorFlow needed)
+  temporal.py, tracker.py temporal DisNet: IoU tracker + GRU distance model + GRU next-box model (PyTorch)
   utils.py                NMS, IoU, target building, AP, optional visdom wrapper
 config/                   yolov3, yolov3-tiny, yolov3-kitti cfgs + kitti.data / coco.data
 data/                     class names, a 16+16 image KITTI sample, sample images for detect.py
@@ -143,6 +145,32 @@ for the Euclidean camera-object distance or `depth` for the distance along the o
 occluded objects are skipped, since the paper notes that partial boxes hurt accuracy. For your own data, pass
 annotation json files in the authors' format with `--annotations` (see the script's `--help`). On synthetic data from a
 pinhole-camera model, the trainer recovers distances to within the noise floor of the data (about 7 % error).
+
+## Temporal (GRU) DisNet
+
+The authors' repository also has a recurrent variant (`DisNetRNN*.py`). `utils/temporal.py` re-implements it in PyTorch:
+
+- **Distance:** the six DisNet features of an object's last 3 frames go through three stacked GRUs (128, 128, 64 units);
+  the distance of the last frame is used.
+- **Tracking:** detections are matched to tracked objects by IoU (same class, greedy, threshold 0.3).
+- **Missed detections:** a second GRU predicts the object's next box (last box plus a learned shift). When the detector
+  misses an object, the track continues on the predicted box for up to 3 frames and is drawn in orange.
+- **Young tracks:** until a track has a full window, the feed-forward DisNet is used.
+
+Train it on the label files of the KITTI tracking benchmark (`data_tracking_label_2.zip`, no images needed):
+
+```bash
+python train_disnet_rnn.py --kitti_tracking_labels /path/to/training/label_02
+python video.py --temporal_model generated_files/disnet_gru.pt --disnet_model generated_files/disnet_kitti.npz ...
+```
+
+The trainer splits by **sequence**, not by object, and trains a feed-forward DisNet on the same sequences, so the
+report compares the GRU with a feed-forward model on identical test windows (and the box model with "box stays" and
+"constant velocity"). Whether the GRU is more accurate than the feed-forward model has to be read from that report;
+it is not assumed. KITTI tracking is recorded at 10 frames per second, so for video at another frame rate `video.py`
+spaces the 3 window frames about 0.1 s apart (`--stride`, or `utils.temporal.stride_for_fps`). The tests
+(`tests/test_temporal.py`) cover the tracker, coasting through missed detections, strides, save / load and the trainer
+on synthetic pinhole-camera sequences; the model has not been trained on the real KITTI tracking labels in this repository's tests.
 
 ## Notes and known limitations
 
